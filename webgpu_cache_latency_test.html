@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU Cache Latency Approximation (Improved)</title>
+</head>
+<body>
+  <h2>WebGPU Cache Latency Approximation (Improved)</h2>
+  <pre id="output">Initializing...</pre>
+
+  <script type="module">
+    async function run() {
+      const output = document.getElementById('output');
+
+      if (!navigator.gpu) {
+        output.textContent = 'WebGPU not supported on this browser.';
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+
+      // WGSL shader - increase loop count for workload
+      const shaderCode = `
+        @group(0) @binding(0) var<storage, read_write> data : array<u32>;
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+          let idx = gid.x;
+          if (idx >= arrayLength(&data)) {
+            return;
+          }
+
+          var val = data[idx];
+          // Heavy loop for workload
+          for (var i = 0u; i < 10000u; i = i + 1u) {
+            val = val + 1u - 1u;
+          }
+          data[idx] = val;
+        }
+      `;
+
+      // Compile shader
+      const shaderModule = device.createShaderModule({
+        code: shaderCode
+      });
+
+      // Pipeline
+      const pipeline = device.createComputePipeline({
+        layout: 'auto',
+        compute: {
+          module: shaderModule,
+          entryPoint: 'main'
+        }
+      });
+
+      // Buffer sizes in elements (u32)
+      const bufferSizes = [1024, 8192, 65536, 524288];
+      const iterations = 10;
+
+      output.textContent = 'Running tests...\n\n';
+
+      for (const size of bufferSizes) {
+        let totalTime = 0;
+
+        for (let iter = 0; iter < iterations; iter++) {
+          // Create storage buffer with MapRead usage so we can map later
+          const storageBuffer = device.createBuffer({
+            size: size * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            mappedAtCreation: true,
+          });
+
+          // Initialize buffer data to zeros
+          {
+            const arrayBuffer = storageBuffer.getMappedRange();
+            new Uint32Array(arrayBuffer).fill(0);
+            storageBuffer.unmap();
+          }
+
+          // Bind group
+          const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{
+              binding: 0,
+              resource: {
+                buffer: storageBuffer
+              }
+            }]
+          });
+
+          // Command encoder
+          const commandEncoder = device.createCommandEncoder();
+
+          const passEncoder = commandEncoder.beginComputePass();
+          passEncoder.setPipeline(pipeline);
+          passEncoder.setBindGroup(0, bindGroup);
+          const workgroupCount = Math.ceil(size / 64);
+          passEncoder.dispatchWorkgroups(workgroupCount);
+          passEncoder.end();
+
+          // Copy result to a readback buffer (because storage buffer might not be mappable after compute)
+          const readbackBuffer = device.createBuffer({
+            size: size * 4,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+          });
+
+          commandEncoder.copyBufferToBuffer(
+            storageBuffer, 0,
+            readbackBuffer, 0,
+            size * 4
+          );
+
+          const gpuCommands = commandEncoder.finish();
+
+          const startTime = performance.now();
+
+          device.queue.submit([gpuCommands]);
+
+          // Wait for GPU operations to complete and map buffer
+          await readbackBuffer.mapAsync(GPUMapMode.READ);
+
+          const endTime = performance.now();
+
+          // Unmap buffer so it can be destroyed automatically
+          readbackBuffer.unmap();
+
+          totalTime += (endTime - startTime);
+
+          // Cleanup buffers (optional, GC handles it)
+        }
+
+        const avgTime = totalTime / iterations;
+        output.textContent += `Buffer size: ${size} elements - Average execution time over ${iterations} runs: ${avgTime.toFixed(3)} ms\n`;
+      }
+
+      output.textContent += '\nTest complete.';
+    }
+
+    run();
+  </script>
+</body>
+</html>
