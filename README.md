@@ -1,8 +1,7 @@
-````markdown
 # 🔍 WebGPU Cache Latency Approximation
 
-This project performs an **experimental analysis of GPU cache behavior** using WebGPU in the browser.  
-By observing how compute execution time varies with buffer size, we gain insights into **GPU cache hits, misses, and parallelism**—without directly accessing the cache.
+This project performs an **experimental analysis of GPU cache behavior** using WebGPU in the browser.
+By observing how compute execution time varies with buffer size, we gain insights into **GPU cache hits, misses, and parallelism** — without directly accessing the cache.
 
 ---
 
@@ -10,9 +9,9 @@ By observing how compute execution time varies with buffer size, we gain insight
 
 To approximate GPU cache latency behavior by:
 
-- Running the same compute task over buffers of increasing sizes
-- Measuring how execution time changes
-- Inferring cache efficiency and memory access cost indirectly
+* Running the same compute task over buffers of increasing sizes
+* Measuring how execution time changes
+* Inferring cache efficiency and memory access cost indirectly
 
 ---
 
@@ -20,17 +19,19 @@ To approximate GPU cache latency behavior by:
 
 ### 1. Buffer Setup
 
-We define four buffer sizes:
+We test four buffer sizes (number of 32-bit unsigned integers):
 
 ```js
-const bufferSizes = [1024, 8192, 65536, 524288]; // in u32 elements
-````
+const bufferSizes = [1024, 8192, 65536, 524288];
+```
 
-Each buffer is initialized with zeroes and used as storage for compute threads.
+Each buffer is initialized with zeros and sent to the GPU for processing.
 
 ---
 
-### 2. Compute Shader (WGSL)
+### 2. Compute Shader and the Heavy Loop
+
+The compute shader runs a function on each buffer element **in parallel**:
 
 ```wgsl
 @compute @workgroup_size(64)
@@ -39,101 +40,69 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (idx >= arrayLength(&data)) return;
 
   var val = data[idx];
+
+  // Heavy loop: repeated 10,000 times
   for (var i = 0u; i < 10000u; i = i + 1u) {
     val = val + 1u - 1u;
   }
+
   data[idx] = val;
 }
 ```
 
-**What it does:**
+**Why run the loop 10,000 times?**
 
-* Each thread reads one element from the buffer.
-* Performs dummy computation (looping 10,000 times).
-* Writes the result back.
-
-This simulates realistic workload on GPU cores, while ensuring memory access plays a role in latency.
-
----
-
-### 3. Dispatching Work
-
-For each buffer:
-
-* Threads are launched with one thread per data element.
-* Threads are grouped into `@workgroup_size(64)` for efficient dispatch.
-* GPU is instructed to process the buffer in parallel.
+* The loop creates a **meaningful workload** so timing measurements are **significant and reliable**.
+* Without this loop, the GPU might finish too quickly, making timing noisy or dominated by setup overhead.
+* The loop **does not change the data** (adding and subtracting 1 cancels out) — it just forces repeated computation.
+* This repeated operation **stresses the cache and memory system** by causing many memory accesses per thread.
+* It helps **amplify differences** caused by whether data fits in GPU cache or spills into slower memory.
 
 ---
 
-### 4. Measuring Time
+### 3. Parallel Execution and Thread Groups
 
-* A timer starts just before submitting commands to the GPU.
-* After execution, results are copied to a readable buffer.
-* Timer stops once the GPU signals completion.
-
-```js
-const startTime = performance.now();
-device.queue.submit([gpuCommands]);
-await readbackBuffer.mapAsync(GPUMapMode.READ);
-const endTime = performance.now();
-```
-
-The average time is calculated over 10 iterations per buffer size.
+* Each GPU thread is assigned a **unique global ID** (`gid.x`) corresponding to a buffer element.
+* Threads run in groups of 64 (`@workgroup_size(64)`), processing elements in parallel batches.
+* This parallelism helps observe how the GPU manages multiple simultaneous memory accesses with different buffer sizes.
 
 ---
 
-## 📈 Sample Output
+### 4. Measuring Time to Approximate Latency
 
-```
-Buffer size: 1024 elements - Average execution time over 10 runs: 6.280 ms
-Buffer size: 8192 elements - Average execution time over 10 runs: 3.770 ms
-Buffer size: 65536 elements - Average execution time over 10 runs: 4.240 ms
-Buffer size: 524288 elements - Average execution time over 10 runs: 8.130 ms
-```
+* Time is recorded just before submitting GPU commands.
+* The program waits until GPU processing completes and results are mapped back.
+* The elapsed time includes both compute and memory access delays.
+* Running multiple iterations and averaging ensures stable and meaningful measurements.
 
 ---
 
-## 🔍 Interpretation
+### 5. Interpreting Results
 
-### ✅ What We See:
+Here are the average execution times observed over 10 runs for each buffer size in this experiment:
 
-| Buffer Size    | Observation                                                        |
-| -------------- | ------------------------------------------------------------------ |
-| **1024**       | Slow — not enough threads to fully utilize GPU, overhead dominates |
-| **8192–65536** | Fast — buffer fits well in cache, threads run in parallel          |
-| **524288**     | Slower — buffer exceeds cache, memory latency increases            |
+| Buffer Size (elements) | Average Execution Time (ms) |
+| ---------------------- | --------------------------- |
+| 1024                   | 6.280                       |
+| 8192                   | 3.770                       |
+| 65536                  | 4.240                       |
+| 524288                 | 8.130                       |
 
-### ⚡ What's Happening:
+**What do these numbers tell us?**
 
-* When the buffer fits in GPU cache → **cache hits** → fast compute
-* When the buffer exceeds cache → **cache misses** → memory fetches → slower compute
-* Very small buffers waste compute power due to low parallelism
+* For **1024 elements (smallest buffer)**, time is relatively high. This is due to fixed overheads in GPU command setup and less efficient parallel utilization for very small workloads.
+* For **8192 elements**, execution time decreases significantly. This size likely fits well in GPU cache and allows better parallel utilization, resulting in faster processing.
+* At **65536 elements**, time increases slightly but remains efficient, indicating partial cache usage and beginning of data spilling beyond cache.
+* At **524288 elements (largest buffer)**, time increases notably, as data exceeds cache size and must be fetched from slower memory, causing cache misses and higher latency.
 
----
-
-## 🧪 Why This Is Useful
-
-Even without reading hardware counters, we can **observe GPU behavior through timing patterns**. This experiment shows:
-
-* How GPU caches impact compute workloads
-* That performance ≠ just buffer size—it depends on memory hierarchy and parallelism
-* A simple way to probe GPU characteristics using WebGPU and WGSL
+This pattern reflects how GPU cache hierarchy and memory system affect performance. By measuring execution time across buffer sizes, we approximate cache latency behavior indirectly.
 
 ---
 
-## 🖥️ Run It Yourself
+## Conclusion
 
-1. Open the `index.html` file in a WebGPU-supported browser:
-
-   * Latest **Chrome**, **Edge**, or **Canary**
-   * Enable WebGPU via `chrome://flags/#enable-unsafe-webgpu` if needed
-
-2. View results in the browser window.
+This experiment helps us understand GPU cache effects through observable execution times. While we don’t directly measure cache hits or misses, the timing data combined with buffer size reveals how cache and memory bandwidth impact GPU compute workloads.
 
 ---
-
-Enjoy exploring the GPU from your browser! 🚀
-
 
 
