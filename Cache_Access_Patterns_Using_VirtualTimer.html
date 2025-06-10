@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebGPU Cache Probe Comparison</title>
+</head>
+<body>
+  <script type="module">
+    async function main() {
+      if (!navigator.gpu) {
+        console.error("WebGPU not supported.");
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+
+      const shaderCode = `
+        struct Data {
+          counter: atomic<u32>,
+          time_no_eviction: u32,
+          time_after_eviction: u32,
+        };
+
+        @group(0) @binding(0) var<storage, read_write> data: Data;
+
+        @compute @workgroup_size(1)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          if (id.x == 0u) {
+            var t = 0u;
+            loop {
+              if (atomicLoad(&data.counter) == 1u) {
+                break;
+              }
+              t = t + 1u;
+            }
+            data.time_no_eviction = t;
+          }
+
+          if (id.x == 1u) {
+            atomicStore(&data.counter, 1u);
+            var trash = array<u32, 1024>();
+            var j = 0u;
+            loop {
+              trash[j % 1024u] = j;
+              j = j + 1u;
+              if (j > 100000u) {
+                break;
+              }
+            }
+            var t2 = 0u;
+            loop {
+              if (t2 > 50000u) {
+                break;
+              }
+              t2 = t2 + 1u;
+            }
+            data.time_after_eviction = t2;
+          }
+        }
+      `;
+
+      const module = device.createShaderModule({ code: shaderCode });
+
+      const pipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: {
+          module,
+          entryPoint: "main"
+        }
+      });
+
+      const bufferSize = 16;
+
+      const timerBuffer = device.createBuffer({
+        size: bufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+      });
+
+      const readBuffer = device.createBuffer({
+        size: bufferSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+
+      const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: timerBuffer } }
+        ]
+      });
+
+      const commandEncoder = device.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(2);
+      pass.end();
+
+      commandEncoder.copyBufferToBuffer(timerBuffer, 0, readBuffer, 0, bufferSize);
+      device.queue.submit([commandEncoder.finish()]);
+
+      await readBuffer.mapAsync(GPUMapMode.READ);
+      const arrayBuf = readBuffer.getMappedRange();
+      const data = new Uint32Array(arrayBuf);
+
+      console.log("\n[Cache Access Timing Results]");
+      console.log("No Eviction (Cache Hit Expected):", data[1]);
+      console.log("After Self-Eviction (Cache Miss Expected):", data[2]);
+      console.log("Delta (Time Difference):", data[2] - data[1]);
+
+      readBuffer.unmap();
+    }
+
+    main();
+  </script>
+</body>
+</html>
