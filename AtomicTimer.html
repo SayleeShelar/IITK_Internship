@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Atomic Timer Final Version</title>
+</head>
+<body>
+  <h2>WebGPU Atomic Timer – Final Version (No Barrier)</h2>
+  <pre id="output">Running...</pre>
+
+  <script type="module">
+    async function initWebGPU() {
+      const output = document.getElementById('output');
+      if (!navigator.gpu) {
+        output.textContent = "WebGPU not supported.";
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+
+      const shaderCode = `
+        struct Shared {
+          flags: array<atomic<u32>, 5>
+        };
+
+        @group(0) @binding(0) var<storage, read_write> sharedData : Shared;
+
+        @compute @workgroup_size(1)
+        fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+          let id = gid.x;
+
+          // Flag index:
+          // 0 = thread 0 ready
+          // 1 = thread 1 ready
+          // 2 = stop signal
+          // 3 = timer count
+          // 4 = handshake flag
+
+          // Mark thread ready
+          atomicStore(&sharedData.flags[id], 1u);
+
+          // Wait until both threads are ready
+          loop {
+            if (atomicLoad(&sharedData.flags[0]) == 1u &&
+                atomicLoad(&sharedData.flags[1]) == 1u) {
+              break;
+            }
+          }
+
+          if (id == 0u) {
+            var count: u32 = 0u;
+
+            // Signal to thread 1 that timer is starting
+            atomicStore(&sharedData.flags[4], 123u);
+
+            loop {
+              if (atomicLoad(&sharedData.flags[2]) == 5u) {
+              atomicStore(&sharedData.flags[3], count);
+                break;
+              }
+                // else if (count == 100u){
+                // continue;
+                // }
+                else{
+                count = count + 1u;
+              }
+
+              //count = count + 1u;
+            }
+              
+
+            //atomicStore(&sharedData.flags[3], count);
+           }
+
+          if (id == 1u) {
+            // Wait for thread 0 to start counting
+            loop {
+              if (atomicLoad(&sharedData.flags[4]) == 123u) {
+                 var dummy: u32 = 0u;
+            for (var i: u32 = 0u; i < 100000000u; i = i + 1u) {
+             if(i==99999999u){
+                atomicStore(&sharedData.flags[2], 5u);
+                break;
+              }
+              else{
+              // dummy = dummy + i;
+              continue;
+            // }
+              // if (dummy > 100000u) {
+              //   atomicStore(&sharedData.flags[2], 5u);
+              //   break;
+              // }
+              }
+            }
+              break;
+        }
+        }
+
+          //   var dummy: u32 = 0u;
+          //   for (var i: u32 = 0u; i < 10000u; i = i + 1u) {
+          //     dummy = dummy + i;
+          //   }
+          //     if dummy == 10000u {
+          //       atomicStore(&sharedData.flags[2], 5u);
+          //     }
+
+          //   atomicStore(&sharedData.flags[2], 5u); // Send stop signal
+           }
+        }
+      `;
+
+      const shaderModule = device.createShaderModule({ code: shaderCode });
+
+      const info = await shaderModule.getCompilationInfo();
+      if (info.messages.length > 0) {
+        let hadError = false;
+        for (const msg of info.messages) {
+          if (msg.type === 'error') hadError = true;
+          console[msg.type === 'error' ? 'error' : 'warn'](
+            `${msg.lineNum}:${msg.linePos} - ${msg.message}`
+          );
+        }
+        if (hadError) {
+          output.textContent = "Shader failed to compile.";
+          return;
+        }
+      }
+
+      const bindGroupLayout = device.createBindGroupLayout({
+        entries: [{
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        }],
+      });
+
+      const pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+        compute: {
+          module: shaderModule,
+          entryPoint: 'main',
+        }
+      });
+
+      const bufferSize = 5 * 4;
+      const storageBuffer = device.createBuffer({
+        size: bufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true
+      });
+
+      new Uint32Array(storageBuffer.getMappedRange()).fill(0);
+      storageBuffer.unmap();
+
+      const bindGroup = device.createBindGroup({
+        layout: bindGroupLayout,
+        entries: [{
+          binding: 0,
+          resource: { buffer: storageBuffer }
+        }]
+      });
+
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(2); // Two threads
+      pass.end();
+
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      const readBuffer = device.createBuffer({
+        size: bufferSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+
+      const copyEncoder = device.createCommandEncoder();
+      copyEncoder.copyBufferToBuffer(storageBuffer, 0, readBuffer, 0, bufferSize);
+      device.queue.submit([copyEncoder.finish()]);
+      await readBuffer.mapAsync(GPUMapMode.READ);
+
+      const data = new Uint32Array(readBuffer.getMappedRange());
+      const [t0Ready, t1Ready, stopSignal, timerCount, debugFlag] = data;
+
+      output.textContent = `
+Thread 0 Ready: ${t0Ready}
+Thread 1 Ready: ${t1Ready}
+Stop Signal:    ${stopSignal}
+Timer Count:    ${timerCount}
+Debug Flag:     ${debugFlag}
+      `.trim();
+    }
+
+    initWebGPU();
+  </script>
+</body>
+</html>
