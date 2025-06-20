@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU Covert Channel – Bit Transmission</title>
+</head>
+<body>
+  <h2>WebGPU Covert Channel – Bit Transmission Demo</h2>
+  <pre id="output">Running...</pre>
+  <script type="module">
+    async function init() {
+      const output = document.getElementById('output');
+      if (!navigator.gpu) {
+        output.textContent = 'WebGPU not supported.';
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+
+      const shaderCode = `
+        struct Shared {
+          flags: array<atomic<u32>, 9>
+        };
+
+        @group(0) @binding(0) var<storage, read_write> sharedData: Shared;
+        @group(0) @binding(1) var<storage, read_write> data: array<u32>;
+
+        @compute @workgroup_size(1)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+          let id = gid.x;
+
+          // Thread 0 – Timer
+          if (id == 0u) {
+            atomicStore(&sharedData.flags[0], 1u);
+
+            // Wait for thread 1 ready
+            loop {
+              if (atomicLoad(&sharedData.flags[1]) == 1u) { break; }
+            }
+
+            // Signal thread 1 to start priming
+            atomicStore(&sharedData.flags[8], 1u);
+
+            // Wait for priming done
+            loop {
+              if (atomicLoad(&sharedData.flags[4]) == 10u) { break; }
+            }
+
+            // Signal thread 1 to begin probe
+            atomicStore(&sharedData.flags[7], 1u);
+
+            // Start timing
+            var count: u32 = 0u;
+            loop {
+              if (atomicLoad(&sharedData.flags[5]) == 5u) {
+                atomicStore(&sharedData.flags[6], count);
+                break;
+              }
+              count = count + 1u;
+            }
+          }
+
+          // Thread 1 – Sender (prime and probe)
+          else if (id == 1u) {
+            atomicStore(&sharedData.flags[1], 1u);
+
+            // Wait for start signal from thread 0
+            loop {
+              if (atomicLoad(&sharedData.flags[8]) == 1u) { break; }
+            }
+
+            // Prime cache
+            for (var i: u32 = 0u; i < 2048u; i = i + 1u) {
+              data[i] = data[i] + 1u;
+            }
+
+            // Notify done priming
+            atomicStore(&sharedData.flags[4], 10u);
+
+            // Wait for eviction or skip
+            loop {
+              if (atomicLoad(&sharedData.flags[2]) == 1u) { break; }
+            }
+
+            // Wait for timing start signal
+            loop {
+              if (atomicLoad(&sharedData.flags[7]) == 1u) { break; }
+            }
+
+            // Probe cache
+            var sum: u32 = 0u;
+            for (var i: u32 = 0u; i < 2048u; i = i + 1u) {
+              sum = sum + data[i];
+            }
+
+            // Notify done probing
+            atomicStore(&sharedData.flags[5], 5u);
+            atomicStore(&sharedData.flags[3], 1u); // Debug flag
+          }
+
+          // Thread 2 – Evictor (controls bit transmission)
+          else if (id == 2u) {
+
+
+            // Wait for priming done
+            loop {
+              if (atomicLoad(&sharedData.flags[4]) == 10u) { break; }
+            }
+            let bitToSend: u32 = 0u; // Change to 1u to send bit 1 (evict)
+
+            atomicStore(&sharedData.flags[2], 0u); // Clear eviction flag
+
+            if (bitToSend == 1u) {
+              for (var i: u32 = 0; i < 8192u; i = i + 1u) {
+                data[i] = data[i] + 1u;
+              }
+            }
+
+            atomicStore(&sharedData.flags[2], 1u); // Signal eviction complete (or skipped)
+          }
+        }
+      `;
+
+      const module = device.createShaderModule({ code: shaderCode });
+      const info = await module.getCompilationInfo();
+      if (info.messages.some(msg => msg.type === 'error')) {
+        output.textContent = 'Shader compilation failed.';
+        return;
+      }
+
+      const sharedBuffer = device.createBuffer({
+        size: 9 * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true
+      });
+      const sharedArray = new Uint32Array(sharedBuffer.getMappedRange());
+      sharedArray.fill(0);
+      sharedBuffer.unmap();
+
+      const dataBuffer = device.createBuffer({
+        size: 8192 * 4,
+        usage: GPUBufferUsage.STORAGE
+      });
+
+      const bindLayout = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        ]
+      });
+
+      const pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bindLayout] }),
+        compute: { module, entryPoint: 'main' }
+      });
+
+      const bindGroup = device.createBindGroup({
+        layout: bindLayout,
+        entries: [
+          { binding: 0, resource: { buffer: sharedBuffer } },
+          { binding: 1, resource: { buffer: dataBuffer } },
+        ]
+      });
+
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(3);
+      pass.end();
+
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      const readBuffer = device.createBuffer({
+        size: 9 * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+
+      const copyEncoder = device.createCommandEncoder();
+      copyEncoder.copyBufferToBuffer(sharedBuffer, 0, readBuffer, 0, 9 * 4);
+      device.queue.submit([copyEncoder.finish()]);
+      await readBuffer.mapAsync(GPUMapMode.READ);
+
+      const data = new Uint32Array(readBuffer.getMappedRange());
+      const [t0, t1, t2, debugFlag, primeDone, probeDone, time, probeSignal, startSignal] = data;
+
+      output.textContent = `
+Thread 0 Ready: ${t0}
+Thread 1 Ready: ${t1}
+Thread 2 Ready: 1
+Receiver Done: ${probeDone}
+Measured Time: ${time}
+Debug Flag: ${debugFlag}
+Inferred Bit: ${time > 100 ? 1 : 0} (1 = cache miss, 0 = hit)
+      `.trim();
+    }
+
+    init();
+  </script>
+</body>
+</html>
